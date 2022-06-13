@@ -116,7 +116,7 @@ def quickplotgrib(file, klevel= 20, cmap = 'turbo', ax=None, filetype='hrrr', \
     
     if filetype == 'hrrr':
         grb_var = grb_file.select(name='Vertical velocity')
-        cube = grbVar_to_cube(grb_var, type='hybrid')['data']
+        cube = grbVar_to_cube(grb_var )['data']
         w_limits = [-50,10]
         w_sign   = -1.0
     else:
