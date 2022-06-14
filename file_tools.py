@@ -19,14 +19,6 @@ from contextlib import contextmanager
 from zipfile import *
 import io
 import dask.array as da
-# backend functions
-from xesmf.backend import (
-    Grid,
-    esmf_regrid_build,
-    esmf_regrid_apply,
-)
-from xesmf.smm import read_weights, apply_weights
-
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -159,11 +151,11 @@ def regrid_gridrad(date,fins,ftarget):
         results = pool.map(partial(gridrad_loop, files = fins, input_grid=input_grid, target_grid=target_grid, regrid=regrid ), np.arange(len(fins)))
         t1 = time.time()
 '''      
-def regrid_mrms(date,hours,fins,ftarget,outdir,mrms_vars):
+def regrid_mrms(t,date,hours,fins,ftarget,outdir,weights_file,mrms_vars):
     
         
     #Extract the correct zip files
-    file = fins[0]
+    file = fins[t]
     tmpdir = "%s/tmp"%outdir
     cmd = "mkdir -p %s"%tmpdir
     with ZipFile(file) as z:
@@ -171,10 +163,8 @@ def regrid_mrms(date,hours,fins,ftarget,outdir,mrms_vars):
         zip_hours = [s for s in zip_vars if "00.zip" in s]
         for hr in zip_hours:
             if not any('Rotation' in var for var in mrms_vars ):
-                weights_file = "/work/larissa.reames/mrms_to_hrrr_econus_weights.nc"
                 outfname = "%s/%s_MRMS_ECONUS.nc"%(outdir,os.path.splitext(hr)[0])
             else:
-                weights_file = "/work/larissa.reames/rotmrms_to_hrrr_econus_weights.nc"
                 outfname = "%s/%s_ROTMRMS_ECONUS.nc"%(outdir,os.path.splitext(hr)[0])
 
             hour = os.path.splitext(hr)[0][-4:]
@@ -189,7 +179,7 @@ def regrid_mrms(date,hours,fins,ftarget,outdir,mrms_vars):
                     
                     for var in mrms_vars:
                         var_file = [s for s in zip_vars if var in s and not any(x in s for x in
-                                               ("conusPlus","alaska","guam","hawaii"))][0]
+                                               ("conusPlus","alaska","guam","hawaii","carib"))][0]
                         grb_file = '%s/%s'%(tmpdir,var_file)
                         
                         if not os.path.exists(grb_file):
@@ -208,14 +198,15 @@ def regrid_mrms(date,hours,fins,ftarget,outdir,mrms_vars):
                     
                     print("reading input data into dataset")
                     print(matching)
-                    ds_in = xr.open_mfdataset(matching, parallel=True,join="override")
-                    
-                    i = -1
-                    
-                    for varname, da in ds_in.data_vars.items():
-                        print(varname)
-                        ds_in = ds_in.rename(name_dict={varname:mrms_vars[i]})
-                        i-=1
+                    isds = False
+                    for i,fname in enumerate(matching):
+                        if not isds:
+                            tmp = xr.open_dataset(fname)
+                            ds_in = tmp.rename(name_dict={list(tmp.keys())[0]:mrms_vars[i]})
+                            isds = True
+                        else:
+                            tmp = xr.open_dataset(fname)
+                            ds_in = xr.merge([ds_in,tmp.rename(name_dict={list(tmp.keys())[0]:mrms_vars[i]})],join='override')
                                      
                     print(ds_in)                
                     print("Getting output lat/lons")
