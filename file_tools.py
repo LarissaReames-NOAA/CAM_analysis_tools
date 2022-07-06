@@ -151,7 +151,7 @@ def regrid_gridrad(date,fins,ftarget):
         results = pool.map(partial(gridrad_loop, files = fins, input_grid=input_grid, target_grid=target_grid, regrid=regrid ), np.arange(len(fins)))
         t1 = time.time()
 '''      
-def regrid_mrms(t,date,hours,fins,ftarget,outdir,weights_file,mrms_vars):
+def regrid_mrms(t,date,hours,fins,ftarget,outdir,weights_file,mrms_vars,mrms_names):
     
         
     #Extract the correct zip files
@@ -202,7 +202,7 @@ def regrid_mrms(t,date,hours,fins,ftarget,outdir,weights_file,mrms_vars):
                     for i,fname in enumerate(matching):
                         if not isds:
                             tmp = xr.open_dataset(fname)
-                            ds_in = tmp.rename(name_dict={list(tmp.keys())[0]:mrms_vars[i]})
+                            ds_in = tmp.rename(name_dict={list(tmp.keys())[0]:mrms_names[i]})
                             isds = True
                         else:
                             tmp = xr.open_dataset(fname)
@@ -227,6 +227,13 @@ def regrid_mrms(t,date,hours,fins,ftarget,outdir,weights_file,mrms_vars):
                     print("apply regridder")
                     ds_out.compute()
                     
+                    et_comb = ds_out[[x for x in ds_out.data_vars if x in
+                                      ["EchoTop_30","EchoTop_50","EchoTop_60"]]].to_array(dim='heightAboveGroundLevelET')
+                    ds_out = ds_out.drop([x for x in ds_out.data_vars if x in ["EchoTop_30","EchoTop_50","EchoTop_60"]])
+                    ds_out['et'] = et_comb
+                    ds_out['heightAboveGroundLevelET'] = [30,50,60]
+                    ds_out['heightAboveGroundLevelET'].attrs['units'] = 'dBZ'
+                    
                     print("Creating dataset and writing to file")
 
                     ds_out.attrs['date']       = date
@@ -237,7 +244,7 @@ def regrid_mrms(t,date,hours,fins,ftarget,outdir,weights_file,mrms_vars):
 
                     ds_out.to_netcdf(outfname, mode='w') 
                     
-def regrid_rrfs(f,date,hours,fins,ftarget,weights_file,outdir,grib2_vars=None):    
+def regrid_rrfs(f,date,hours,fins,ftarget,weights_file,outdir,sw_corner,ne_corner,grib2_vars=None):    
     if not grib2_vars:
         grib2_vars = {     #  keys                 / No. of Dims /  Type   / bottomLevel / paramCategory / paramNumber
                'TEMP':     [{'shortName':'t','typeOfLevel':'hybrid'}],
@@ -245,57 +252,339 @@ def regrid_rrfs(f,date,hours,fins,ftarget,weights_file,outdir,grib2_vars=None):
                'U':        [{'shortName':'u','typeOfLevel':'hybrid'}],
                'V':        [{'shortName':'v','typeOfLevel':'hybrid'}],
                'GPH':      [{'shortName':'gh','typeOfLevel':'hybrid'}],
-               'UH':       [{'typeOfLevel': 'heightAboveGroundLayer', 'level':2000, 'shortName':'uphl'}],
-               'CREF':     [{'typeOfLevel': 'atmosphere', 'shortName':'refc'}],
+               'UH':       [{'name':'Updraft Helicity','stepType': 'max'}],
+               'CREF':     [{'shortName':'refc'}],
+               'REF263K':  [{'shortName':'refd'}],
                'HGT':      [{'shortName':'orog','typeOfLevel':'surface'}],
                'REFL_10CM':[{'shortName':'refd','typeOfLevel':'hybrid'}],
+               'VIL':      [{'shortName':'veril'}],
+               'maxref_1km':[{"typeOfLevel":"heightAboveGround",'stepType': 'max','level':1000}],
+               'ACPC':     [{'shortName':'tp'}]
                }
     #Extract the correct zip files
     file = fins[f]
     tmpdir = "%s/tmp"%outdir
     cmd = "mkdir -p %s"%tmpdir
     
-    with ZipFile(file) as z:
-        zip_files = z.namelist()
-        for file in zip_file:
-            if not any (hour in file for h in hours): continue
+    #with ZipFile(file) as z:
+    #    zip_files = z.namelist()
+    #    for file in zip_file:
+    #        if not any (hour in file for h in hours): continue
             
-            print("reading input data into dataset")
-            for k, key in enumerate(grib2_vars):
-                if k == 0:
-                    ds_in = xr.open_dataset(file,filter_by_keys=grib_vars[key][0])
-                else:
-                    ds_in = xr.merge(ds_in,xr.open_dataset(file,filter_by_keys=grib_vars[key][0]))
+    print("reading input data into dataset")
+    for k, key in enumerate(grib2_vars):
+        print(key)
+        if k == 0:
+            ds_in = xr.open_dataset(file,filter_by_keys=grib2_vars[key][0],engine='cfgrib')
+            dt64 = ds_in.valid_time.data
+            ts = (dt64 - np.datetime64('1970-01-01T00:00:00')) / np.timedelta64(1, 's')
+            fcst_time = datetime.utcfromtimestamp(ts)
+            #print(ds_in.valid_time.time)
+            #cst_time = ds_in[list(ds_in.keys())[0]].initial_time
+            #fcst_time = datetime.strptime(fcst_time,'%m/%d/%Y (%H:%M)')
+        elif key=='REFL_10CM':
+            ds = xr.open_dataset(file, filter_by_keys={'typeOfLevel':'hybrid'}, engine='cfgrib')
+            nz,ny,nx = np.shape(ds.q.values)
+            grb_var = cmpref.calcrefl10cm(ds.q.values, ds.clwmr.values, ds.rwmr.values, ds.snmr.values, ds.grle.values, ds.t.values, ds.pres.values, nz, nx, ny)
+            attrs = ds_in.refc.attrs
+            attrs['GRIB_typeOfLevel'] = 'hybrid'
+            attrs['GRIB_name'] = 'Simulated 10cm Radar Reflectivity'
+            attrs['GRIB_shortname'] = 'refl10cm'
+            attrs['long_name'] = 'Simulated 10cm Radar Reflectivity'
+            refl = xr.DataArray(grb_var, dims = ds_in.t.dims, 
+                                coords=ds_in.t.coords,
+                                attrs=attrs)
+            ds_in['refl10cm'] = refl
+        elif key=='VIL':
+            continue                                                                                                              
+        else:
+            ds = xr.open_dataset(file,filter_by_keys=grib2_vars[key][0],engine='cfgrib')
+            if list(ds.variables)[-1] == 'unknown':
+                ds = ds.rename({'unknown':key})
+            ds_in = xr.merge([ds_in,ds],join='override')
+
+    print("Getting output lat/lons")
+
+    grid = xr.open_dataset(ftarget,engine='netcdf4')
+    lat_out= grid.variables['lats']
+    lon_out = grid.variables['lons']
+
+    ds_out = xr.Dataset(coords=dict(lats = (["south_north","west_east"], lat_out,{'units':'degrees_north'}),
+                              lons = (["south_north","west_east"], lon_out, {'units':'degrees_east'})))
+
+    print("creating regriddiner")   
+    regridder = xe.Regridder(ds_in, ds_out, "bilinear",
+                             filename=weights_file, 
+                             reuse_weights=True)
+    print("create dask graph")
+    ds_out = regridder(ds_in,keep_attrs=True)
+    print("apply regridder")
+    ds_out.compute()
+
+    print("rename coordinates")
+    ds_out = ds_out.rename({'lats':'latitude','lons':'longitude'})
+    
+    print("get coordinates")
+    lats = ds_out.latitude.values
+    lons = ds_out.longitude.values
+    
+    print("Crop lat/lons")
+    if np.max(lons) > 180.0: lons = lons - 360.0
+    crop = xr.DataArray(np.logical_and(np.logical_and(lats>sw_corner[0],
+                         lats<ne_corner[0]),np.logical_and(lons>sw_corner[1],
+                                                           lons<ne_corner[1])),
+                        dims=['south_north','west_east'])
+    ds_out = ds_out.where(crop,drop=True)
+    
+    if 'REFL_10CM' in list(grib2_vars):
+        print("Compute auxillary variables from REFL_10CM")
+        
+        #echo top
+        nz,ny,nx = np.shape(ds_out.t.data)
+        echo_hgt_domain = np.empty([3,ny,nx])
+        for d, db in enumerate([30.0, 50.0, 60.0]):
+            refl_db = np.ma.masked_where(ds_out.refl10cm < db, ds_out.refl10cm)
+            mask_hgt = np.ma.masked_where(np.ma.getmask(refl_db), ds_out.gh)
+
+            mask_hgt = mask_hgt.filled(0)
+            echo_hgt_domain[d,:] = np.nanmax(mask_hgt, axis=0)
+            attrs = ds_out.t.attrs
+            attrs['GRIB_shortname'] = 'retop'
+            attrs['GRIB_name'] = 'Simulated Radar Echo Top'
+            attrs['long_name'] = 'Simulated Radar Echo Top'
+            attrs['GRIB_unts'] = 'm'
+            attrs['units'] = 'm'
+            attrs['GRIB_typeOfLevel'] = 'heightAboveGroundLevel'
+            attrs['GRIB_cfVarName'] = 'et'
+            attrs['GRIB_cfName'] = 'echo_top'
             
-            print("Getting output lat/lons")
+        echo_hgt = xr.DataArray(echo_hgt_domain, dims = ["heightAboveGroundLevelET","south_north","west_east"],
+                                coords=dict(latitude = (["south_north","west_east"], lat_out,{'units':'degrees_north'}),
+                                            longitude = (["south_north","west_east"], lon_out, {'units':'degrees_east'}),
+                                            heightAboveGroundLevelET = (["heightAboveGroundLevelET"], [30.0, 50.0, 60.0], 
+                                                                       {'units':'dBZ'})), 
+                                attrs=attrs)
+        ds_out['et'] = echo_hgt
+        
+        # refl at -10C
+        ind_10c = np.argmin(np.abs(ds_out.t.values-263.15),axis=0)
+        idx = np.indices(ind_10c.shape)
+        ref_10c = ds_out.refl10cm.values[ind_10c,idx[0],idx[1]]
+        #ref_10c = np.take_along_axis(ds_out.refl10cm.values,ind_10c,axis=0)
+        
+        attrs['GRIB_shortname'] = 'refd'
+        attrs['GRIB_name'] = 'Isothermal Reflectivity at -10C'
+        attrs['long_name'] = 'Isothermal Reflectivity at -10C'
+        attrs['GRIB_unts'] = 'dBZ'
+        attrs['units'] = 'dBZ'
+        attrs['GRIB_typeOfLevel'] = 'heightAboveGroundLevel'
+        attrs['GRIB_cfVarName'] = 'refd'
+        attrs['GRIB_cfName'] = 'reflectivity_10c'
+        ref_10c = xr.DataArray(ref_10c, dims = ds_out.orog.dims, coords = ds_out.orog.coords, attrs = attrs)
+        ds_out['refd'] = ref_10c
+        
+        # height of composite reflectivity
+        ind_refc = np.argmax(ds_out.refl10cm.values,axis=0)
+        idx = np.indices(ind_refc.shape)
+        hgt_refc = ds_out.gh.values[ind_refc,idx[0],idx[1]]
+        #hgt_refc = np.take_along_axis(ds_out.gh.values,ind_refc,axis=0)
+        attrs['GRIB_shortname'] = 'zrefc'
+        attrs['GRIB_name'] = 'Height of Composite Reflectivity Above Sea Level'
+        attrs['long_name'] = 'Height of Composite Reflectivity Above Sea Level'
+        attrs['GRIB_unts'] = 'm'
+        attrs['units'] = 'm'
+        attrs['GRIB_typeOfLevel'] = 'heightAboveGroundLevel'
+        attrs['GRIB_cfVarName'] = 'zrefc'
+        attrs['GRIB_cfName'] = 'height_refc'
+        hgt_refc = xr.DataArray(hgt_refc, coords = ds_out.orog.coords, dims = ds_out.orog.dims, attrs = attrs)
+        ds_out['zrefc'] = hgt_refc
+        
+        # vil
+        dgph = ds_out.gh.values[1:,:] - ds_out.gh.values[:-1,:]
+        vil = 0.00344 * (10.0**(0.05 * (ds_out.refl10cm.values[1:,:] + ds_out.refl10cm.values[:-1,:]))) **0.57143 * dgph /1000.0
+        vil = np.insert(vil,0,0.00344 * ds_out.refl10cm.values[0,:] **0.57143 * ds_out.gh.values[0,:] /1000.0,axis=0)
+        vil = np.nansum(vil,axis=0)
+        attrs = ds_out.orog.attrs
+        attrs['GRIB_name'] = 'Simulated Radar Vertically Integrated Liquid'
+        attrs['GRIB_shortname'] = 'vil'
+        attrs['long_name'] = 'Simulated Radar Vertically Integrated Liquid'
+        attrs['GRIB_unts'] = 'kg m^-3'
+        attrs['units'] = 'kg m^-3'
+        attrs['GRIB_cfVarName'] = 'veril'
+        attrs['GRIB_cfName'] = 'vert_int_liquid'
+        vil = xr.DataArray(vil, dims = ds_out.orog.dims, 
+                            coords=ds_out.orog.coords,
+                            attrs=attrs)
+        ds_out['veril'] = vil   
+        
+    print("Creating dataset and writing to file")
+    outfname = "%s/%s_RRFSB_ECONUS.nc"%(outdir,fcst_time.strftime('%Y%m%d%H%M'))
+    ds_out.attrs['date']       = date
+    ds_out.attrs['time']       = fcst_time.strftime('%H:%M')
+    ds_out.attrs['gridType']   = 'HRRR_ECONUS'
+    ds_out.attrs['DateTime']   = datetime.now().strftime("%Y%m%d_%H:%M:%S")
+    ds_out.attrs['TimeStamp']  = datetime.timestamp(datetime.now())
 
-            grid = xr.open_dataset(ftarget,engine='netcdf4')
-            lat_out= grid.variables['lats']
-            lon_out = grid.variables['lons']
+    ds_out.to_netcdf(outfname, mode='w') 
 
-            ds_out = xr.Dataset(coords=dict(lats = (["south_north","west_east"], lat_out,{'units':'degrees_north'}),
-                                      lons = (["south_north","west_east"], lon_out, {'units':'degrees_east'})))
+def regrid_hrrr(f,date,hours,fins,outdir,sw_corner, ne_corner, grib2_vars=None):    
+    if not grib2_vars:
+        grib2_vars = {     #  keys                 / No. of Dims /  Type   / bottomLevel / paramCategory / paramNumber
+               'P':        [{'shortName':'pres','typeOfLevel':'hybrid'}],
+               'TEMP':     [{'shortName':'t','typeOfLevel':'hybrid'}],
+               'W':        [{'shortName':'w','typeOfLevel':'hybrid'}],
+               'U':        [{'shortName':'u','typeOfLevel':'hybrid'}],
+               'V':        [{'shortName':'v','typeOfLevel':'hybrid'}],
+               'GPH':      [{'shortName':'gh','typeOfLevel':'hybrid'}],
+               'UH':       [{'name':'Updraft Helicity','stepType': 'max'}],
+               'CREF':     [{'shortName':'refc'}],
+               'REF263K':  [{'shortName':'refd','typeOfLevel': 'isothermal','stepType': 'instant'}],
+               'HGT':      [{'shortName':'orog','typeOfLevel':'surface'}],
+               'REFL_10CM':[{'shortName':'refd','typeOfLevel':'hybrid'}],
+               'VIL':      [{'shortName':'veril'}],
+               'maxref_1km':[{"typeOfLevel":"heightAboveGround",'stepType': 'max','level':1000}],
+               'ACPC':     [{'shortName':'tp'}]
+               }
+    #Extract the correct zip files
+    file = fins[f]
+    tmpdir = "%s/tmp"%outdir
+    cmd = "mkdir -p %s"%tmpdir
+    
+    #with ZipFile(file) as z:
+    #    zip_files = z.namelist()
+    #    for file in zip_file:
+    #        if not any (hour in file for h in hours): continue
+            
+    print("reading input data into dataset")
+    for k, key in enumerate(grib2_vars):
+        if k == 0:
+            ds_in = xr.open_dataset(file,filter_by_keys=grib2_vars[key][0],engine='cfgrib')
+            dt64 = ds_in.valid_time.data
+            ts = (dt64 - np.datetime64('1970-01-01T00:00:00')) / np.timedelta64(1, 's')
+            fcst_time = datetime.utcfromtimestamp(ts)
+            #print(ds_in.valid_time.time)
+            #cst_time = ds_in[list(ds_in.keys())[0]].initial_time
+            #fcst_time = datetime.strptime(fcst_time,'%m/%d/%Y (%H:%M)')
+        elif key=='W':
+            ds = xr.open_dataset(file,filter_by_keys=grib2_vars[key][0],engine='cfgrib')
+            wz = np.array(-ds.w.values / ( (_gravity * ds_in.pres.values) / (_Rgas * ds_in.t.values) ) )
+            ds.w.values = wz
+            attrs = ds_in.t.attrs
+            attrs['GRIB_shortname'] = 'wz'
+            attrs['GRIB_name'] = 'Geometric Vertical Velocity'
+            attrs['long_name'] = 'Geometric Vertical Velocity'
+            attrs['GRIB_unts'] = 'm s**-1'
+            attrs['units'] = 'm s**-1'
+            ds = ds.rename({'w':'wz'})
+            ds.wz.attrs = attrs
+            ds_in = xr.merge([ds_in,ds],join='override')
+        elif key=='REFL_10CM':
+            ds = xr.open_dataset(file, filter_by_keys={'typeOfLevel':'hybrid'}, engine='cfgrib')
+            nz,ny,nx = np.shape(ds.q.values)
+            grb_var = cmpref.calcrefl10cm(ds.q.values, ds.clwmr.values, ds.rwmr.values, ds.snmr.values, ds.grle.values, ds.t.values, ds.pres.values, nz, nx, ny)
+            attrs = ds_in.refc.attrs
+            attrs['GRIB_typeOfLevel'] = 'hybrid'
+            attrs['GRIB_name'] = 'Simulated 10cm Radar Reflectivity'
+            attrs['GRIB_shortname'] = 'refl10cm'
+            attrs['long_name'] = 'Simulated 10cm Radar Reflectivity'
+            refl = xr.DataArray(grb_var, dims = ds_in.t.dims, 
+                                coords=ds_in.t.coords,
+                                attrs=attrs)
+            ds_in['refl10cm'] = refl
+        elif key == 'UH':
+            ds = xr.open_dataset(file,filter_by_keys=grib2_vars[key][0],engine='cfgrib')
+            ds = ds.isel(heightAboveGroundLayer=slice(1,3))
+            ds_in = xr.merge([ds_in,ds],join='override')
+        else:
+            ds = xr.open_dataset(file,filter_by_keys=grib2_vars[key][0],engine='cfgrib')
+            if list(ds.variables)[-1] == 'unknown':
+                ds = ds.rename({'unknown':key})
+            ds_in = xr.merge([ds_in,ds],join='override')
+            
 
-            print("creating regriddiner")   
-            regridder = xe.Regridder(ds_in, ds_out, "bilinear",
-                                     filename=weights_file, 
-                                     reuse_weights=True)
-            print("create dask graph")
-            ds_out = regridder(ds_in)
-            print("apply regridder")
-            ds_out.compute()
-       
-            ds_out = ds_out.reindex(hybrid=list(reversed(ds.hybrid)))
+    print("Crop lat/lons")
+    ds_in = ds_in.rename({'x':'west_east','y':'south_north'})
+    lats = ds_in.latitude.values
+    lons = ds_in.longitude.values
+    if np.max(lons) > 180.0: lons = lons - 360.0
+    crop = xr.DataArray(np.logical_and(np.logical_and(lats>sw_corner[0],
+                         lats<ne_corner[0]),np.logical_and(lons>sw_corner[1],lons<ne_corner[1])),
+                        dims=['south_north','west_east'])
+    ds_out = ds_in.where(crop,drop=True)
+    
+    if 'REFL_10CM' in list(grib2_vars):
+        print("Compute auxillary variables from REFL_10CM")
+        
+        #echo top
+        nz,ny,nx = np.shape(ds_out.t.data)
+        echo_hgt_domain = np.empty([3,ny,nx])
+        for d, db in enumerate([30.0, 50.0, 60.0]):
+            refl_db = np.ma.masked_where(ds_out.refl10cm < db, ds_out.refl10cm)
+            mask_hgt = np.ma.masked_where(np.ma.getmask(refl_db), ds_out.gh)
 
-            print("Creating dataset and writing to file")
+            mask_hgt = mask_hgt.filled(0)
+            echo_hgt_domain[d,:] = np.nanmax(mask_hgt, axis=0)
+            attrs = ds_out.t.attrs
+            attrs['GRIB_shortname'] = 'retop'
+            attrs['GRIB_name'] = 'Simulated Radar Echo Top'
+            attrs['long_name'] = 'Simulated Radar Echo Top'
+            attrs['GRIB_unts'] = 'm'
+            attrs['units'] = 'm'
+            attrs['GRIB_typeOfLevel'] = 'heightAboveGroundLevel'
+            attrs['GRIB_cfVarName'] = 'et'
+            attrs['GRIB_cfName'] = 'echo_top'
+            
+        echo_hgt = xr.DataArray(echo_hgt_domain, dims = ["heightAboveGroundLevelET","south_north","west_east"],
+                                coords=dict(latitude = (["south_north","west_east"], ds_out.latitude.values,{'units':'degrees_north'}),
+                                            longitude = (["south_north","west_east"], ds_out.longitude.values, {'units':'degrees_east'}),
+                                            heightAboveGroundLevelET = (["heightAboveGroundLevelET"], [30.0, 50.0, 60.0], 
+                                                                       {'units':'dBZ'})), 
+                                attrs=attrs)
+        ds_out['et'] = echo_hgt
+        
+        # refl at -10C
+        ind_10c = np.argmin(np.abs(ds_out.t.values-263.15),axis=0)
+        idx = np.indices(ind_10c.shape)
+        ref_10c = ds_out.refl10cm.values[ind_10c,idx[0],idx[1]]
+        #ref_10c = np.take_along_axis(ds_out.refl10cm.values,ind_10c,axis=0)
+        
+        
+        attrs['GRIB_shortname'] = 'refd'
+        attrs['GRIB_name'] = 'Isothermal Reflectivity at -10C'
+        attrs['long_name'] = 'Isothermal Reflectivity at -10C'
+        attrs['GRIB_unts'] = 'dBZ'
+        attrs['units'] = 'dBZ'
+        attrs['GRIB_typeOfLevel'] = 'heightAboveGroundLevel'
+        attrs['GRIB_cfVarName'] = 'refd'
+        attrs['GRIB_cfName'] = 'reflectivity_10c'
+        ref_10c = xr.DataArray(ref_10c, dims = ds_out.orog.dims, coords = ds_out.orog.coords, attrs = attrs)
+        ds_out['refd'] = ref_10c
+        
+        # height of composite reflectivity
+        ind_refc = np.argmax(ds_out.refl10cm.values,axis=0)
+        idx = np.indices(ind_refc.shape)
+        hgt_refc = ds_out.gh.values[ind_refc,idx[0],idx[1]]
+        #hgt_refc = np.take_along_axis(ds_out.gh.values,ind_refc,axis=0)
+        attrs['GRIB_shortname'] = 'zrefc'
+        attrs['GRIB_name'] = 'Height of Composite Reflectivity Above Sea Level'
+        attrs['long_name'] = 'Height of Composite Reflectivity Above Sea Level'
+        attrs['GRIB_unts'] = 'm'
+        attrs['units'] = 'm'
+        attrs['GRIB_typeOfLevel'] = 'heightAboveGroundLevel'
+        attrs['GRIB_cfVarName'] = 'zrefc'
+        attrs['GRIB_cfName'] = 'height_refc'
+        hgt_refc = xr.DataArray(hgt_refc, coords = ds_out.orog.coords, dims = ds_out.orog.dims, attrs = attrs)
+        ds_out['zrefc'] = hgt_refc
+    
+    print("Creating dataset and writing to file")
+    outfname = "%s/%s_HRRR_ECONUS.nc"%(outdir,fcst_time.strftime('%Y%m%d%H%M'))
+    ds_out.attrs['date']       = date
+    ds_out.attrs['time']       = fcst_time.strftime('%H:%M')
+    ds_out.attrs['gridType']   = 'HRRR_ECONUS'
+    ds_out.attrs['DateTime']   = datetime.now().strftime("%Y%m%d_%H:%M:%S")
+    ds_out.attrs['TimeStamp']  = datetime.timestamp(datetime.now())
 
-            ds_out.attrs['date']       = date
-            ds_out.attrs['time']       = os.path.splitext(hr)[0][-4:]
-            ds_out.attrs['gridType']   = 'HRRR_ECONUS'
-            ds_out.attrs['DateTime']   = datetime.now().strftime("%Y%m%d_%H:%M:%S")
-            ds_out.attrs['TimeStamp']  = datetime.timestamp(datetime.now())
-
-            ds_out.to_netcdf(outfname, mode='w') 
+    ds_out.to_netcdf(outfname, mode='w') 
 
 def esmf_regrid(lat_in, lon_in, lat_out, lon_out, data, data_name='', return_regrid=False):
 
